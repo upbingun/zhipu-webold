@@ -13,7 +13,7 @@ export default async function handler(req, res) {
         'Authorization': `Bearer ${process.env.ZHIPU_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'glm-4-flash',
+        model: 'glm-4.5-air',
         messages: messages,
         temperature: 0.7,
         stream: true
