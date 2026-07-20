@@ -17,6 +17,7 @@ body{font:-apple-system-body;background:#000;color:#fff;height:100vh;display:fle
 #input-box{display:flex;padding:8px;background:#1c1c1e;gap:8px}
 #input{flex:1;padding:12px 16px;border-radius:24px;border:none;background:#2c2c2e;color:#fff;font-size:16px;outline:none}
 #send{width:44px;height:44px;border-radius:50%;border:none;background:#007aff;color:#fff;font-size:20px;cursor:pointer;flex-shrink:0}
+#send:disabled{opacity:0.4}
 .loading{display:inline-block;width:8px;height:8px;border-radius:50%;background:#999;animation:blink 0.8s infinite}
 @keyframes blink{50%{opacity:0.3}}
 
@@ -46,6 +47,10 @@ body{font:-apple-system-body;background:#000;color:#fff;height:100vh;display:fle
   <button id="send">↑</button>
 </div>
 <script>
+// ========== 配置 ==========
+const RELAY_TIMEOUT = 8900;  // 8.9 秒主动中断，留 1.1 秒缓冲
+const MAX_RELAY = 10;        // 最多接力 10 次
+
 // ========== 对话历史 ==========
 const systemPrompt = '你是AI助手，用简洁的中文回答。遵守以下规则：\n- 禁止使用表格\n- 禁止使用LaTeX数学公式（如$$、$、\\frac等）';
 
@@ -109,23 +114,125 @@ function addMsg(role, text) {
   chatDiv.appendChild(div);
   div.scrollIntoView({ behavior: 'smooth' });
 
-  // 屏幕最多保留50条
+  // 屏幕最多保留 50 条
   while (chatDiv.children.length > 50) {
     chatDiv.removeChild(chatDiv.firstChild);
   }
 }
 
-// ========== 发送请求 ==========
+// ========== 带接力续写的流式请求 ==========
+async function streamWithRelay(aiDiv) {
+  let fullReply = '';
+  let relayCount = 0;
+
+  while (relayCount < MAX_RELAY) {
+    relayCount++;
+
+    // 构造请求 body
+    let requestMessages;
+    if (relayCount === 1) {
+      // 第一次：发完整对话历史
+      requestMessages = messages;
+    } else {
+      // 续写：完整历史 + 已生成内容 + 继续指令
+      requestMessages = [
+        ...messages,
+        { role: 'assistant', content: fullReply },
+        { role: 'user', content: '请继续' }
+      ];
+    }
+
+    // 创建超时控制器
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), RELAY_TIMEOUT);
+
+    let isComplete = false;
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: requestMessages }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || '请求失败');
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') {
+              isComplete = true;
+              continue;
+            }
+            try {
+              const chunk = JSON.parse(data);
+              const content = chunk.choices[0].delta.content;
+              if (content) {
+                fullReply += content;
+                aiDiv.innerHTML = renderMD(fullReply);
+                aiDiv.scrollIntoView({ behavior: 'smooth' });
+              }
+            } catch(e) {}
+          }
+        }
+      }
+
+      // 自然结束，跳出循环
+      if (isComplete) {
+        return fullReply;
+      }
+
+    } catch (e) {
+      clearTimeout(timeoutId);
+
+      if (e.name === 'AbortError') {
+        // 超时中断，进入下一次循环续写
+        // 保持 loading 状态，fullReply 继续累积
+        continue;
+      }
+
+      // 真正的网络错误
+      throw e;
+    }
+  }
+
+  // 达到最大接力次数，返回已有内容
+  return fullReply;
+}
+
+// ========== 发送消息 ==========
 async function send() {
   const text = inputEl.value.trim();
   if (!text) return;
 
-  // 用户消息
+  // 禁用发送按钮，防止重复发送
+  sendBtn.disabled = true;
+  inputEl.disabled = true;
+
+  // 添加用户消息
   addMsg('user', text);
   messages.push({ role: 'user', content: text });
   inputEl.value = '';
 
-  // 创建AI消息占位
+  // 创建 AI 消息占位
   const aiDiv = document.createElement('div');
   aiDiv.className = 'msg assistant';
   aiDiv.innerHTML = '<span class="loading"></span>';
@@ -135,59 +242,26 @@ async function send() {
   let fullReply = '';
 
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: messages })
-    });
-
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || '请求失败');
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
-          try {
-            const chunk = JSON.parse(data);
-            const content = chunk.choices[0].delta.content;
-            if (content) {
-              fullReply += content;
-              aiDiv.innerHTML = renderMD(fullReply);
-              aiDiv.scrollIntoView({ behavior: 'smooth' });
-            }
-          } catch(e) {}
-        }
-      }
-    }
+    fullReply = await streamWithRelay(aiDiv);
   } catch(e) {
     aiDiv.innerHTML = '出错了：' + e.message;
     fullReply = '';
   }
 
-  // 保存AI完整回复
+  // 保存 AI 完整回复
   if (fullReply) {
     messages.push({ role: 'assistant', content: fullReply });
   }
 
-  // DOM超过50条清理
+  // DOM 超过 50 条清理
   while (chatDiv.children.length > 50) {
     chatDiv.removeChild(chatDiv.firstChild);
   }
+
+  // 恢复发送按钮
+  sendBtn.disabled = false;
+  inputEl.disabled = false;
+  inputEl.focus();
 }
 
 // ========== 事件绑定 ==========
